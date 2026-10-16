@@ -77,18 +77,21 @@ const EFFORT_BUDGETS = { low: 16384, medium: 32768, high: 65536, xhigh: 98304, m
 // Ask the bridge for the account's live catalog (Kiro is the source of truth).
 // Returns null on any failure so the caller can fall back to models.json.
 async function fetchLiveModels() {
-  try {
-    const res = await fetch(`${BASE_URL}/models`, {
-      headers: { authorization: `Bearer ${TOKEN}` },
-      signal: AbortSignal.timeout(5000),
-    });
-    if (!res.ok) return null;
-    const body = await res.json();
-    const data = Array.isArray(body?.data) ? body.data : [];
-    return data.length ? data : null;
-  } catch {
-    return null;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const res = await fetch(`${BASE_URL}/models`, {
+        headers: { authorization: `Bearer ${TOKEN}` },
+        signal: AbortSignal.timeout(15000),
+      });
+      if (res.ok) {
+        const body = await res.json();
+        const data = Array.isArray(body?.data) ? body.data : [];
+        if (data.length) return data;
+      }
+    } catch {}
+    await new Promise((resolve) => setTimeout(resolve, 2000));
   }
+  return null;
 }
 
 // Turn one Kiro catalog entry into the OpenCode model shape.

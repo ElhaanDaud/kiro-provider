@@ -313,6 +313,19 @@ async function liveModelList(token, region) {
   return list;
 }
 
+// Warm the catalog in the background so the first /v1/models call is fast and the
+// plugin never races a cold control-plane round-trip.
+async function warmModelCatalog() {
+  const token = resolveApiKey();
+  if (!token) return;
+  try {
+    const deps = await loadApiKeyDeps();
+    await liveModelList(token, deps.config.default_region || 'us-east-1');
+  } catch (e) {
+    log('model catalog warm-up skipped:', e?.message || e);
+  }
+}
+
 async function handleApiKeyChat(res, body, apiKey) {
   const deps = await loadApiKeyDeps();
   const parsed = JSON.parse(body);
@@ -421,6 +434,7 @@ const server = http.createServer(async (req, res) => {
       } catch {}
       const changed = setApiKey(key);
       log(`api key ${key ? 'set' : 'cleared'}${changed ? '' : ' (unchanged)'}`);
+      if (changed && resolveApiKey()) void warmModelCatalog();
       return sendJson(res, 200, { ok: true, changed, configured: !!resolveApiKey() });
     }
     if (!authorized(req)) {
@@ -476,4 +490,5 @@ server.listen(PORT, HOST, () => {
     log(`WARNING: KIRO_BRIDGE_HOST=${HOST} is not loopback — the bridge is reachable from the network`);
   }
   log(`auth: required (${KEYS.size} accepted key(s)); connect a Kiro API key with "opencode auth login kiro --method key"`);
+  void warmModelCatalog();
 });
