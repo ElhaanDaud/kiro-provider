@@ -251,6 +251,68 @@ function modelList(registry) {
   };
 }
 
+// --- Live account model catalog (Kiro control plane) ------------------------
+
+// Kiro exposes the models available to the signed-in account through its control
+// plane. That is the source of truth: OpenCode lists exactly what the account can
+// use, so nothing here (or in models.json) is treated as authoritative.
+const MODELS_TTL_MS = 5 * 60 * 1000;
+let modelsCache = { at: 0, region: null, list: null };
+
+async function fetchControlPlaneModels(token, region) {
+  const res = await fetch(`https://management.${region}.kiro.dev/`, {
+    method: 'POST',
+    headers: {
+      authorization: `Bearer ${token}`,
+      tokentype: 'API_KEY',
+      origin: 'AI_EDITOR',
+      'x-amzn-kiro-agent-mode': 'vibe',
+      'content-type': 'application/x-amz-json-1.0',
+      'x-amz-target': 'KiroControlPlaneBearerService.ListAvailableModels',
+    },
+    body: JSON.stringify({ origin: 'AI_EDITOR' }),
+    signal: AbortSignal.timeout(10_000),
+  });
+  if (!res.ok) {
+    const detail = await res.text().catch(() => '');
+    throw new Error(`ListAvailableModels HTTP ${res.status} ${redact(detail).slice(0, 200)}`);
+  }
+  return res.json();
+}
+
+// Pass Kiro's own fields through so the plugin can build accurate models (name,
+// rate multiplier, token limits, input types, thinking/effort schema). Standard
+// OpenAI clients ignore the extra keys.
+function toOpenAIModels(models) {
+  return models.map((m) => ({
+    id: m.modelId,
+    object: 'model',
+    created: 0,
+    owned_by: 'kiro',
+    name: m.modelName || m.modelId,
+    description: m.description,
+    rateMultiplier: m.rateMultiplier,
+    rateUnit: m.rateUnit,
+    tokenLimits: m.tokenLimits || null,
+    supportedInputTypes: m.supportedInputTypes || null,
+    thinking: m.additionalModelRequestFieldsSchema || null,
+  }));
+}
+
+async function liveModelList(token, region) {
+  const now = Date.now();
+  if (modelsCache.list && modelsCache.region === region && now - modelsCache.at < MODELS_TTL_MS) {
+    return modelsCache.list;
+  }
+  const data = await fetchControlPlaneModels(token, region);
+  const modeled = toOpenAIModels(Array.isArray(data.models) ? data.models : []);
+  if (modeled.length === 0) throw new Error('ListAvailableModels returned no models');
+  const list = { object: 'list', data: modeled };
+  modelsCache = { at: now, region, list };
+  log(`live model catalog: ${modeled.length} models (region=${region})`);
+  return list;
+}
+
 async function handleApiKeyChat(res, body, apiKey) {
   const deps = await loadApiKeyDeps();
   const parsed = JSON.parse(body);
@@ -371,7 +433,13 @@ const server = http.createServer(async (req, res) => {
       const apiKey = resolveApiKey();
       if (apiKey) {
         const deps = await loadApiKeyDeps();
-        return sendJson(res, 200, modelList(deps.buildModelRegistry()));
+        const region = deps.config.default_region || 'us-east-1';
+        try {
+          return sendJson(res, 200, await liveModelList(apiKey, region));
+        } catch (e) {
+          log('live model list unavailable, using static registry:', e?.message || e);
+          return sendJson(res, 200, modelList(deps.buildModelRegistry()));
+        }
       }
       const s = await ensureReady();
       return sendJson(res, 200, modelList(s.registry));

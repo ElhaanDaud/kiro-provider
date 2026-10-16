@@ -70,6 +70,55 @@ function buildModels() {
   }));
 }
 
+// Thinking budgets per effort level (mirrors Kiro's 1024–128000 range) used to
+// build the variant presets advertised for models that expose an effort enum.
+const EFFORT_BUDGETS = { low: 16384, medium: 32768, high: 65536, xhigh: 98304, max: 128000 };
+
+// Ask the bridge for the account's live catalog (Kiro is the source of truth).
+// Returns null on any failure so the caller can fall back to models.json.
+async function fetchLiveModels() {
+  try {
+    const res = await fetch(`${BASE_URL}/models`, {
+      headers: { authorization: `Bearer ${TOKEN}` },
+      signal: AbortSignal.timeout(5000),
+    });
+    if (!res.ok) return null;
+    const body = await res.json();
+    const data = Array.isArray(body?.data) ? body.data : [];
+    return data.length ? data : null;
+  } catch {
+    return null;
+  }
+}
+
+// Turn one Kiro catalog entry into the OpenCode model shape.
+function mapLiveModel(m) {
+  const inputs = (Array.isArray(m.supportedInputTypes) ? m.supportedInputTypes : ['TEXT']).map((t) =>
+    t === 'IMAGE' ? 'image' : t === 'PDF' ? 'pdf' : 'text',
+  );
+  const thinking = !!m.thinking?.properties?.thinking;
+  const effort = m.thinking?.properties?.output_config?.properties?.effort?.enum || [];
+  const variants = effort.map((level) => ({
+    id: level,
+    body: { thinkingConfig: { thinkingBudget: EFFORT_BUDGETS[level] ?? 32768 } },
+  }));
+  const limits = m.tokenLimits || {};
+  return {
+    id: m.id,
+    modelID: m.id,
+    providerID: PROVIDER_ID,
+    name: m.rateMultiplier ? `${m.name} (${m.rateMultiplier}x)` : m.name,
+    capabilities: { tools: true, input: inputs.length ? inputs : ['text'], output: ['text'] },
+    variants,
+    time: { released: 0 },
+    cost: [],
+    status: 'active',
+    enabled: true,
+    limit: { context: limits.maxInputTokens || 200000, output: limits.maxOutputTokens || 64000 },
+    ...(thinking ? { compatibility: { reasoningField: 'reasoning_content' } } : {}),
+  };
+}
+
 let attempted = false;
 
 async function ensureBridge() {
@@ -146,6 +195,28 @@ let apiKey = null;
 export default {
   id: 'kiro.provider',
   async setup(ctx) {
+    // Migration: earlier versions wrote the Kiro API key to disk — remove it.
+    try {
+      fs.rmSync(path.join(DIR, 'kiro-api-key.txt'), { force: true });
+    } catch {}
+
+    apiKey = await resolveConnectedApiKey(ctx);
+
+    if (!attempted) {
+      attempted = true;
+      await ensureBridge();
+    }
+
+    if (apiKey) await pushApiKey(apiKey);
+
+    // Register the models Kiro reports for this account. The account catalog is
+    // the source of truth; models.json is only a fallback when it is unreachable.
+    const live = await fetchLiveModels();
+    const models = live ? live.map(mapLiveModel) : buildModels();
+    console.log(
+      `[kiro] registering ${models.length} models (${live ? 'live account catalog' : 'fallback models.json'})`,
+    );
+
     await ctx.provider.transform((editor) => {
       editor.add({
         info: {
@@ -155,7 +226,7 @@ export default {
           package: spec.provider.package,
           settings: { baseURL: BASE_URL, apiKey: TOKEN },
         },
-        models: buildModels(),
+        models,
       });
     });
 
@@ -174,19 +245,5 @@ export default {
     } catch (e) {
       console.log('[kiro] integration registration failed: ' + (e?.message || e));
     }
-
-    // Migration: earlier versions wrote the Kiro API key to disk — remove it.
-    try {
-      fs.rmSync(path.join(DIR, 'kiro-api-key.txt'), { force: true });
-    } catch {}
-
-    apiKey = await resolveConnectedApiKey(ctx);
-
-    if (!attempted) {
-      attempted = true;
-      await ensureBridge();
-    }
-
-    if (apiKey) await pushApiKey(apiKey);
   },
 };
