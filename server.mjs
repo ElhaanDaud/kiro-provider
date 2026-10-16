@@ -11,6 +11,7 @@ import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { execFile } from 'node:child_process';
 import { Readable } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 
@@ -29,6 +30,18 @@ function redact(value) {
   return String(value ?? '')
     .replace(/ksk_[A-Za-z0-9._-]+/g, 'ksk_[redacted]')
     .replace(/kiro-[A-Za-z0-9._-]{16,}/g, 'kiro-[redacted]');
+}
+
+// NTFS ignores POSIX file modes, so the bridge token file would inherit the
+// folder ACL (readable by other local accounts). Restrict it to the current
+// user explicitly. No-op off Windows.
+function hardenFile(file) {
+  if (process.platform !== 'win32') return;
+  const user = process.env.USERNAME;
+  if (!user) return;
+  try {
+    execFile('icacls', [file, '/inheritance:r', '/grant:r', `${user}:(F)`], () => {});
+  } catch {}
 }
 
 // Kiro headless API key (prefixed "ksk_"). Held in memory only: seeded from
@@ -136,10 +149,12 @@ function loadKeys() {
   }
   if (fs.existsSync(KEY_PATH)) {
     for (const line of fs.readFileSync(KEY_PATH, 'utf8').split(/\r?\n/)) if (line.trim()) keys.add(line.trim());
+    hardenFile(KEY_PATH);
   }
   if (keys.size === 0) {
     const token = 'kiro-' + crypto.randomBytes(24).toString('base64url');
     fs.writeFileSync(KEY_PATH, token + '\n', { mode: 0o600 });
+    hardenFile(KEY_PATH);
     keys.add(token);
   }
   return keys;
@@ -206,13 +221,14 @@ function presentedTokens(req) {
 }
 
 function authorized(req) {
-  if (KEYS.size === 0) return true;
   const presented = presentedTokens(req);
-  if (presented.some((token) => KEYS.has(token))) return true;
-  // OpenCode attaches the connected Kiro API key as the provider credential, so
-  // it can arrive here as the bearer instead of the generated bridge key.
   const kiroKey = resolveApiKey();
-  return !!kiroKey && presented.includes(kiroKey);
+  // API-key mode: ONLY the Kiro API key may call the API. The local bridge token
+  // is not a credential for /v1/* (it is only used by the /internal endpoint).
+  if (kiroKey) return presented.includes(kiroKey);
+  // OAuth mode (no API key configured): fall back to the local bridge token.
+  if (KEYS.size === 0) return true;
+  return presented.some((token) => KEYS.has(token));
 }
 
 // Fixed-window rate limit per presented token, to keep a runaway local client

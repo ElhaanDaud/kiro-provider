@@ -6,7 +6,27 @@ import * as logger from '../../plugin/logger.js';
 import { makePlaceholderEmail } from '../../plugin/sync/kiro-cli-parser.js';
 import { readActiveProfileArnFromKiroCli } from '../../plugin/sync/kiro-cli-profile.js';
 import { fetchUsageLimits } from '../../plugin/usage.js';
+const ALLOWED_BROWSER_HOSTS = ['awsapps.com', 'amazonaws.com', 'aws.amazon.com', 'kiro.dev'];
+const isSafeBrowserUrl = (raw) => {
+    try {
+        const u = new URL(raw);
+        if (u.protocol !== 'https:')
+            return false;
+        const host = u.hostname.toLowerCase();
+        if (!ALLOWED_BROWSER_HOSTS.some((h) => host === h || host.endsWith(`.${h}`)))
+            return false;
+        // cmd.exe (Windows) reinterprets these even when passed as an argument.
+        return !/[&|^<>"`\s]/.test(raw);
+    }
+    catch {
+        return false;
+    }
+};
 const openBrowser = (url) => {
+    if (!isSafeBrowserUrl(url)) {
+        logger.warn('Refusing to open untrusted verification URL');
+        return;
+    }
     const platform = process.platform;
     const [bin, ...args] = platform === 'win32'
         ? ['cmd', '/c', 'start', '', url]

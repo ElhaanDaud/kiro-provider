@@ -13,7 +13,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { spawn } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 const DIR = path.dirname(fileURLToPath(import.meta.url));
@@ -28,6 +28,17 @@ const PROVIDER_ID = 'kiro';
 
 const spec = JSON.parse(fs.readFileSync(path.join(DIR, 'models.json'), 'utf8'));
 
+// NTFS ignores POSIX file modes; restrict the bridge token file to the current
+// user so other local accounts cannot read it. No-op off Windows.
+function hardenFile(file) {
+  if (process.platform !== 'win32') return;
+  const user = process.env.USERNAME;
+  if (!user) return;
+  try {
+    execFile('icacls', [file, '/inheritance:r', '/grant:r', `${user}:(F)`], () => {});
+  } catch {}
+}
+
 // The bridge gates /v1/* behind a bearer key. Reuse an existing api-key.txt, or
 // generate + persist one so the plugin and the bridge always agree. Passing the
 // same value as KIRO_BRIDGE_TOKEN makes it independent of the file once running.
@@ -40,11 +51,15 @@ function ensureToken() {
       .split(/\r?\n/)
       .map((l) => l.trim())
       .filter(Boolean);
-    if (existing.length) return existing[0];
+    if (existing.length) {
+      hardenFile(KEY_FILE);
+      return existing[0];
+    }
   } catch {}
   const token = 'kiro-' + crypto.randomBytes(24).toString('base64url');
   try {
     fs.writeFileSync(KEY_FILE, token + '\n', { mode: 0o600 });
+    hardenFile(KEY_FILE);
   } catch (e) {
     console.log('[kiro] could not write api-key.txt: ' + e.message);
   }
@@ -80,7 +95,7 @@ async function fetchLiveModels() {
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
       const res = await fetch(`${BASE_URL}/models`, {
-        headers: { authorization: `Bearer ${TOKEN}` },
+        headers: { authorization: `Bearer ${apiKey || TOKEN}` },
         signal: AbortSignal.timeout(15000),
       });
       if (res.ok) {
@@ -227,7 +242,7 @@ export default {
           name: spec.provider.name,
           activation: 'enabled',
           package: spec.provider.package,
-          settings: { baseURL: BASE_URL, apiKey: TOKEN },
+          settings: { baseURL: BASE_URL, apiKey: apiKey || TOKEN },
         },
         models,
       });
