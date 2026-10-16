@@ -213,6 +213,41 @@ function sendJson(res, status, obj) {
   res.end(body);
 }
 
+// Stream an upstream body to the client. An error mid-stream (for example Kiro's
+// "InternalServerException: Encountered unexpectedly high load" carrying
+// MODEL_TEMPORARILY_UNAVAILABLE) surfaces as an 'error' event on the Node
+// Readable. Without a listener Node treats it as unhandled and kills the whole
+// bridge process, so every later request gets ConnectionRefused. Fail just this
+// response instead: close the client socket if the response already started.
+function pipeUpstreamBody(upstream, res) {
+  const source = Readable.fromWeb(upstream.body);
+  source.on('error', (e) => {
+    log('upstream stream error:', redact(e?.message || e));
+    if (res.headersSent) {
+      try {
+        res.destroy();
+      } catch {}
+      return;
+    }
+    try {
+      sendJson(res, 502, { error: { message: redact(e?.message || String(e)), type: 'api_error' } });
+    } catch {}
+  });
+  // Client disconnected or wrote back an error: stop pulling from upstream
+  // instead of letting the rejection escape.
+  res.on('error', () => {
+    try {
+      source.destroy();
+    } catch {}
+  });
+  res.on('close', () => {
+    try {
+      source.destroy();
+    } catch {}
+  });
+  source.pipe(res);
+}
+
 function presentedTokens(req) {
   const auth = (req.headers['authorization'] || '').toString();
   const bearer = auth.replace(/^Bearer\s+/i, '').trim();
@@ -389,7 +424,7 @@ async function handleApiKeyChat(res, body, apiKey) {
     res.end(await upstream.text());
     return;
   }
-  Readable.fromWeb(upstream.body).pipe(res);
+  pipeUpstreamBody(upstream, res);
 }
 
 async function handleChat(req, res) {
@@ -418,7 +453,7 @@ async function handleChat(req, res) {
     res.end(await upstream.text());
     return;
   }
-  Readable.fromWeb(upstream.body).pipe(res);
+  pipeUpstreamBody(upstream, res);
 }
 
 // --- Server -----------------------------------------------------------------
