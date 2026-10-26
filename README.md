@@ -1,24 +1,224 @@
 # OpenCode Kiro Provider
 
-An **OpenCode V2 plugin** that adds the **AWS Kiro (CodeWhisperer)** models
-(Claude Sonnet/Opus/Haiku, DeepSeek, GLM, MiniMax, Qwen) to OpenCode as
-`kiro/<model>`.
+Adds the **AWS Kiro (CodeWhisperer)** models (Claude Sonnet/Opus/Haiku,
+DeepSeek, GLM, MiniMax, Qwen) to OpenCode as `kiro/<model>`, through a local
+OpenAI-compatible bridge that talks to Kiro.
+
+This is a fork of [steverova/kiro-provider](https://github.com/steverova/kiro-provider)
+that also runs on **OpenCode 1.x**. Pick the plugin for your OpenCode version
+(`opencode --version`):
+
+| OpenCode | Plugin | Setup |
+| --- | --- | --- |
+| 1.x | `opencode-v1.mjs` | [Linux setup (OpenCode 1.x)](#linux-setup-opencode-1x) |
+| V2 | `index.mjs` | [Quick start (OpenCode V2)](#quick-start-opencode-v2) |
+
+```
+OpenCode 1.x / V2 ──(OpenAI /v1/chat/completions)──▶ bridge (127.0.0.1:4141)
+   ▲                                                    │
+   └── plugin registers provider + starts bridge        └─▶ AWS Kiro (CodeWhisperer)
+```
+
+## What this fork adds
+
+- **OpenCode 1.x plugin** (`opencode-v1.mjs`). `index.mjs` uses the V2 plugin
+  API, which OpenCode 1.x rejects (`must default export an object with
+  server()`), so `kiro` never shows up. The 1.x plugin starts the same bridge and
+  registers the same `kiro` provider.
+- **Your account's models, including 5.5** (1.x plugin). The bundled model list
+  stops at Opus/Sonnet 5, and the bridge's live list only works with an API key.
+  The plugin reads `kiro-cli chat --list-models` and adds what is missing:
+  `claude-opus-5-5`, `claude-sonnet-5-5`, `claude-haiku-5-5`, `gpt-5.6-sol`,
+  `gpt-5.6-terra`, `gpt-5.6-luna`, ...
+- **Subagents follow the session's provider** (1.x plugin). Subagents started
+  from a `kiro/...` session run on kiro, and from an `anthropic/...` session on
+  anthropic, even when their agent pins an `anthropic/...` model (as every
+  oh-my-openagent agent does). See [Subagents](#subagents).
+- **Token refresh in your Identity Center region** (both plugins). The kiro-cli
+  sync refreshed tokens in the region of the Kiro profile ARN (`us-east-1`), so
+  Identity Center logins from another region (e.g. `ap-south-1`) failed with
+  `Refresh failed: Invalid request`. It now uses the region kiro-cli's token was
+  issued in (`vendor/kiro-auth/dist/plugin/sync/kiro-cli.js`).
+
+## Linux setup (OpenCode 1.x)
+
+Tested with OpenCode 1.19.3, Node.js 24 and kiro-cli 2.34, signed in through IAM
+Identity Center.
+
+### 1. Requirements
+
+- **OpenCode 1.x**: `opencode --version` prints `1.*`.
+- **Node.js 20.11+** with npm, and **git**.
+- **Kiro CLI**, to sign in and to read your model list:
+
+  ```bash
+  curl -fsSL https://cli.kiro.dev/install | bash
+  kiro-cli --version
+  ```
+
+### 2. Sign in to Kiro
+
+```bash
+# Kiro through your organisation (IAM Identity Center)
+kiro-cli login --license pro \
+  --identity-provider https://<your-org>.awsapps.com/start \
+  --region <identity-center-region>
+
+# or Builder ID, Google or GitHub
+kiro-cli login --license free
+```
+
+Add `--use-device-flow` on a machine without a browser (e.g. over SSH). Then
+check:
+
+```bash
+kiro-cli whoami                # account and Kiro profile
+kiro-cli chat --list-models    # the models you will get as kiro/...
+```
+
+OpenCode needs no credentials of its own: the bridge copies the kiro-cli login
+into `~/.config/opencode/kiro.db` when it starts and refreshes it from there. To
+use a Kiro API key instead, see [API key](#api-key).
+
+### 3. Clone and install
+
+```bash
+git clone https://github.com/ElhaanDaud/kiro-provider.git ~/.local/opt/kiro-provider
+cd ~/.local/opt/kiro-provider
+npm install
+```
+
+Any folder works. The bridge runs from it and keeps `api-key.txt` (its local
+bearer token) and `bridge.log` there.
+
+### 4. Load the plugin
+
+OpenCode 1.x loads every `.js` and `.ts` file in `~/.config/opencode/plugins/`.
+Add one that re-exports the plugin from your clone:
+
+```bash
+mkdir -p ~/.config/opencode/plugins
+echo "export { default } from '$HOME/.local/opt/kiro-provider/opencode-v1.mjs';" \
+  > ~/.config/opencode/plugins/kiro-provider.js
+```
+
+- Keep the `.js` extension (`.mjs` files there are not loaded) and the absolute
+  path.
+- Leave `opencode.json` alone: adding this repo with `opencode plugin` or to the
+  `plugin` list loads `index.mjs`, the V2 plugin. Files in `plugins/` also load
+  after the `plugin` list, so the subagent routing runs after other plugins
+  (like oh-my-openagent) have picked a model.
+
+### 5. Check it
+
+```bash
+opencode models kiro           # lists the kiro/... models (and starts the bridge)
+curl -s http://127.0.0.1:4141/health
+# {"status":"ok","ready":true,"auth":"accounts","accounts":1,"region":"us-east-1"}
+opencode run -m kiro/claude-haiku-4-5 "Reply with exactly: pong"
+```
+
+In the TUI, pick a `kiro/...` model with `/models`.
+
+## Using it on OpenCode 1.x
+
+### Thinking
+
+Claude models take a thinking budget as a variant, `low` to `max` (16K to 128K
+tokens): on the `-thinking` ids for the bundled models
+(`kiro/claude-opus-5-thinking`), on the plain id for the models added from your
+account (`kiro/claude-opus-5-5`). Use `--variant` with `opencode run`, or
+`ctrl+t` in the TUI:
+
+```bash
+opencode run -m kiro/claude-opus-5-thinking --variant high "..."
+```
+
+In testing, Kiro returned no reasoning text for the 5.5 models, even at `max`.
+
+### Subagents
+
+When a session on `kiro` or `anthropic` starts a subagent (OpenCode's `task`
+tool, oh-my-openagent's agents), the subagent is moved to that provider. It keeps
+its agent's model where the provider has it:
+
+| Agent's model | Under a `kiro/...` session |
+| --- | --- |
+| `anthropic/claude-opus-4-8`, variant `low` | `kiro/claude-opus-4-8-thinking`, variant `low` |
+| `anthropic/claude-opus-5`, variant `max` | `kiro/claude-opus-5-thinking`, variant `max` |
+| `anthropic/claude-opus-5-5` | `kiro/claude-opus-5-5` |
+| `anthropic/claude-haiku-4-5-20251001` | `kiro/claude-haiku-4-5` |
+| one kiro lacks, e.g. `anthropic/claude-fable-5-1` | the session's own model |
+
+Under an `anthropic/...` session it works the other way round, e.g.
+`kiro/claude-opus-5-thinking` becomes `anthropic/claude-opus-5`.
+
+- Model ids are compared without `-thinking` or a date suffix, with `.` read as
+  `-`. A variant is kept only if the new model has it.
+- Top-level sessions are never changed, and sessions on any other provider leave
+  their subagents alone.
+- If the lookup fails, the subagent keeps its agent's model and `bridge.log`
+  gets a `[kiro adapter] kept ...` line.
+- Subagents can run in parallel: the bridge queues a request only until Kiro
+  starts streaming the reply, and allows 120 requests a minute
+  (`KIRO_BRIDGE_RATE_LIMIT`).
+
+### The bridge
+
+When OpenCode starts, the plugin starts the bridge in the background unless it
+is already running, and leaves it running when OpenCode exits. Restart it after
+updating, changing a `KIRO_*` variable or signing in to another account:
+
+```bash
+fuser -k 4141/tcp                              # stop; the next OpenCode start brings it back
+cd ~/.local/opt/kiro-provider && npm start     # or run it in the foreground
+```
+
+To update:
+
+```bash
+cd ~/.local/opt/kiro-provider && git pull && npm install && fuser -k 4141/tcp
+```
+
+then restart OpenCode.
+
+### API key
+
+The 1.x plugin doesn't add `opencode auth login kiro`. To use a Kiro API key
+(`ksk_...`) instead of the kiro-cli login, put it in the environment OpenCode
+starts from, e.g. in `~/.bashrc`:
+
+```bash
+export KIRO_API_KEY=ksk_...
+```
+
+Then stop the bridge (`fuser -k 4141/tcp`) and start OpenCode from a new shell;
+`/health` reports `"auth":"api_key"`. The model list still comes from kiro-cli,
+or from the bundled list without it.
+
+### Troubleshooting (OpenCode 1.x)
+
+`bridge.log` is in the clone; `grep 'kiro adapter' bridge.log` shows the
+plugin's own messages.
+
+| Symptom | Fix |
+| --- | --- |
+| `Provider not found: kiro`, or no `kiro/...` models | The plugin isn't loaded. Check that `~/.config/opencode/plugins/kiro-provider.js` ends in `.js` and imports the absolute path of `opencode-v1.mjs`, and remove this repo from the `plugin` list in `opencode.json` if you added it. |
+| No 5.5 or GPT 5.6 models | `bridge.log` says `no live model list from kiro-cli`: sign in with `kiro-cli login`, or set `KIRO_CLI` to the kiro-cli binary. |
+| Bridge not running (`curl` gets no answer) | `bridge.log` says `could not start bridge`: OpenCode can't find `node` (common with nvm or desktop launchers). Set `KIRO_NODE` to the output of `command -v node`. |
+| `Refresh failed: Invalid request` | Your Identity Center is outside `us-east-1` and the clone predates the region fix. `git pull`, then restart the bridge. |
+| A subagent doesn't follow the session's provider | Only sessions on `kiro` or `anthropic` are followed. A `kept ...` line in `bridge.log` gives the reason. |
+| `/health` says `"region":"us-east-1"`, but your Identity Center is elsewhere | Expected. `/health` shows `default_region` from `kiro.json`; requests go to the region of your Kiro profile (`kiro-cli whoami`), token refresh to your Identity Center region. |
+
+## Quick start (OpenCode V2)
 
 One install does everything: the plugin **registers the `kiro` provider**, adds
 the **`kiro` auth integration**, and **starts a local bridge** that talks to
 Kiro. Works on **Windows, Linux, and macOS**.
 
-```
-OpenCode V2 ──(OpenAI /v1/chat/completions)──▶ bridge (127.0.0.1:4141)
-   ▲                                              │
-   └── plugin registers provider + starts bridge  └─▶ AWS Kiro (CodeWhisperer)
-```
-
-## Quick start
-
 ```bash
 # 1. Install the plugin (only appends one entry to your config)
-opencode plugin add github:steverova/kiro-provider
+opencode plugin add github:ElhaanDaud/kiro-provider
 
 # 2. Connect your Kiro API key (ksk_...)
 opencode auth login kiro --method key
@@ -27,7 +227,7 @@ opencode auth login kiro --method key
 opencode reload
 ```
 
-## Requirements
+## Requirements (OpenCode V2)
 
 - **Node.js 20.11+** (the plugin spawns the bridge with `node`; override with
   `KIRO_NODE`).
@@ -36,10 +236,10 @@ opencode reload
   Authentication). API keys are available to Kiro Pro, Pro+, Pro Max, and Power
   subscribers; generate one at <https://app.kiro.dev> → **API Keys**.
 
-## Install
+## Install (OpenCode V2)
 
 ```bash
-opencode plugin add github:steverova/kiro-provider
+opencode plugin add github:ElhaanDaud/kiro-provider
 opencode reload
 ```
 
@@ -48,7 +248,7 @@ This command **only adds** the plugin to the `plugins` array in your global
 Verify with:
 
 ```bash
-opencode plugin list      # shows: kiro.provider  <commit>  https://github.com/steverova/kiro-provider.git
+opencode plugin list      # shows: kiro.provider  <commit>  https://github.com/ElhaanDaud/kiro-provider.git
 ```
 
 Once loaded, the plugin registers the `kiro` provider by itself, so there is no
@@ -57,7 +257,8 @@ manual provider setup. Pick a model with `/models` — you'll see `kiro/...`.
 ## Authentication
 
 The bridge can authenticate to Kiro in two ways. **Option A (API key)** is
-recommended.
+recommended on OpenCode V2. On OpenCode 1.x, use Option B (as the
+[Linux setup](#linux-setup-opencode-1x) does) or set [`KIRO_API_KEY`](#api-key).
 
 ### Option A — Kiro API key (recommended)
 
@@ -131,17 +332,23 @@ Environment variables (optional):
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `KIRO_API_KEY` | – | Kiro API key (`ksk_...`); alternative to `auth login`. |
+| `KIRO_API_KEY` | – | Kiro API key (`ksk_...`); alternative to `auth login`, and the only way to pass one on OpenCode 1.x. |
 | `KIRO_BRIDGE_RATE_LIMIT` | `120` | Max requests per minute per token (`0` disables). |
 | `KIRO_BRIDGE_PORT` | `4141` | Bridge port; must match the provider `baseURL`. |
 | `KIRO_BRIDGE_HOST` | `127.0.0.1` | Bind address. |
 | `KIRO_BRIDGE_TOKEN` | – | Extra accepted bridge key(s), comma/space separated. |
 | `KIRO_NODE` | `node` | Node binary used to spawn the bridge. |
+| `KIRO_CLI` | `~/.local/bin/kiro-cli`, else `kiro-cli` on `PATH` | kiro-cli the 1.x plugin reads your model list from. |
 | `KIROCLI_DB_PATH` | – | Override the Kiro CLI database path used for sync. |
 
 ## Models
 
 `-thinking` models stream reasoning in `reasoning_content`.
+
+On OpenCode 1.x the plugin also adds the models your account lists in
+`kiro-cli chat --list-models`. Claude ids use dashes as on `anthropic/...`
+(`kiro/claude-opus-5-5` requests `claude-opus-5.5`), and the names show the
+credit multiplier, e.g. `Claude Opus 5.5 (2x)`.
 
 Disabled because Kiro rejects the effort field on them
 (`additionalModelRequestFields is not supported for this model`):
@@ -152,10 +359,10 @@ Disabled because Kiro rejects the effort field on them
 To change the list, edit `DISABLED_MODELS` in `gen-models.mjs`, run
 `npm run gen-models`, and commit `models.json`.
 
-## Install from a local clone (alternative)
+## Install from a local clone (OpenCode V2)
 
 ```powershell
-git clone https://github.com/steverova/kiro-provider.git kiro-provider
+git clone https://github.com/ElhaanDaud/kiro-provider.git kiro-provider
 cd kiro-provider
 npm install
 ```
@@ -174,7 +381,7 @@ every other setting — it only appends one entry):
 Run `opencode reload`, then connect your API key as in Authentication.
 `npm start` runs the bridge manually if you don't want the plugin to spawn it.
 
-## Troubleshooting
+## Troubleshooting (OpenCode V2)
 
 | Symptom | Fix |
 | --- | --- |
@@ -193,6 +400,7 @@ Run `opencode reload`, then connect your API key as in Authentication.
 | File | Role |
 | --- | --- |
 | `index.mjs` | The OpenCode V2 plugin: registers the provider + integration, starts the bridge. |
+| `opencode-v1.mjs` | The OpenCode 1.x plugin: starts the bridge, registers the provider with your account's models, routes subagents. |
 | `server.mjs` | Local OpenAI-compatible bridge; supports API-key and OAuth auth. |
 | `vendor/kiro-auth/` | Vendored Kiro internals (MIT, from `@zhafron/opencode-kiro-auth`). |
 | `models.json` | Model metadata (generated), so the plugin never imports SQLite. |
@@ -217,6 +425,12 @@ Run `opencode reload`, then connect your API key as in Authentication.
     `tokentype: API_KEY` header. The key lives in the bridge's memory only.
   - **OAuth:** rotates and refreshes the accounts in `kiro.db`.
 
+On OpenCode 1.x, `opencode-v1.mjs` starts the bridge the same way and adds the
+provider through the 1.x `config` hook (package `@ai-sdk/openai-compatible`),
+with the bundled models plus those from `kiro-cli chat --list-models`. Its
+`chat.message` hook moves each subagent's model to the provider of the session
+that started it. It registers no auth integration.
+
 ## Why this exists
 
 The popular plugin `@zhafron/opencode-kiro-auth` is written for the **V1** plugin
@@ -229,10 +443,15 @@ behind a small local OpenAI-compatible bridge, and wires it into OpenCode with a
 native V2 plugin. There is no runtime dependency on the original package and no
 build step.
 
+OpenCode 1.x has the opposite problem: it rejects V2 plugins like `index.mjs`,
+so this fork adds `opencode-v1.mjs`.
+
 ## Security
 
 - The Kiro API key is held **in memory only** in the bridge. The plugin sends it
-  over loopback (`127.0.0.1`) and it is never written to disk or logs.
+  over loopback (`127.0.0.1`) and it is never written to disk or logs. On
+  OpenCode 1.x the key comes from `KIRO_API_KEY`, so it is as private as the
+  place you set it.
 - Every `/v1/*` request requires a bearer token; `/internal/api-key` (used to
   update the key) additionally requires the plugin's own bridge key.
 - Secrets are redacted from `bridge.log`.
