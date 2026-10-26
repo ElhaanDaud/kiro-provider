@@ -46,7 +46,9 @@ export async function syncFromKiroCli() {
                 // serviceRegion wins over data.region: kiro-cli stores data.region as the
                 // OIDC region (often us-east-1) regardless of where the account actually lives.
                 const serviceRegion = extractRegionFromArn(profileArn) || normalizeRegion(data.region);
-                const oidcRegion = serviceRegion;
+                // Token refresh must hit the OIDC region the token was issued in (data.region),
+                // not the profile's service region; they differ for e.g. ap-south-1 IdC logins.
+                const oidcRegion = normalizeRegion(data.region || serviceRegion);
                 const startUrl = typeof data.start_url === 'string'
                     ? data.start_url
                     : typeof data.startUrl === 'string'
