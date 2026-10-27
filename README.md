@@ -39,6 +39,19 @@ OpenCode 1.x / V2 ──(OpenAI /v1/chat/completions)──▶ bridge (127.0.0.1
   Identity Center logins from another region (e.g. `ap-south-1`) failed with
   `Refresh failed: Invalid request`. It now uses the region kiro-cli's token was
   issued in (`vendor/kiro-auth/dist/plugin/sync/kiro-cli.js`).
+- **Long sessions no longer fail with `Input is too long`** (both plugins). Kiro
+  rejects any conversation with 200 or more history messages, however few
+  tokens they hold, and each round of tool calls adds two. OpenCode took the
+  error for a full context window and compacted the session. The bridge now
+  folds the oldest messages into a plain-text transcript once the history passes
+  180 (`vendor/kiro-auth/dist/infrastructure/transformers/history-builder.js`).
+  See [Long sessions and DCP](#long-sessions-and-dcp).
+- **Real token counts** (both plugins). Kiro reports context use as a percentage
+  of the model's window, and the bridge read it against 200K for nearly every
+  model, so 1M models reported a fifth of the tokens they used, to OpenCode's
+  context meter and to DCP alike. It now uses each model's window from
+  `kiro-cli chat --list-models` (the bundled list without kiro-cli), and the 1.x
+  plugin gives OpenCode the same windows.
 
 ## Linux setup (OpenCode 1.x)
 
@@ -163,6 +176,44 @@ Under an `anthropic/...` session it works the other way round, e.g.
   starts streaming the reply, and allows 120 requests a minute
   (`KIRO_BRIDGE_RATE_LIMIT`).
 
+### Long sessions and DCP
+
+Kiro accepts at most 200 messages of history, and each round of tool calls adds
+two. Past 180, the bridge turns the oldest messages into one plain-text
+transcript at the start of the conversation, in steps of 100 so that the start
+stays the same from one request to the next. The model still sees what happened
+there, as text; images in that part are left out.
+
+To have DCP (`@tarquinen/opencode-dcp`) manage the context alone, with no
+compaction, set these (tested with DCP 3.2.0 and oh-my-openagent 5.1.35):
+
+- `~/.config/opencode/opencode.json`: turn off OpenCode's auto-compaction. It is
+  a global setting, so it covers every provider.
+
+  ```json
+  "compaction": { "auto": false }
+  ```
+
+- `~/.omo/omo.jsonc`, if you use oh-my-openagent: its
+  `anthropic-context-window-limit-recovery` hook compacts the session after a
+  "too long" error from any provider, not just Anthropic.
+
+  ```jsonc
+  "[opencode]": { "disabled_hooks": ["anthropic-context-window-limit-recovery"] }
+  ```
+
+- `~/.config/opencode/dcp.jsonc`: give the limits as a share of each model's
+  window, so they fit 200K and 1M models alike, and run DCP in subagents too.
+
+  ```jsonc
+  "compress": { "maxContextLimit": "60%", "minContextLimit": "40%" },
+  "experimental": { "allowSubAgents": true }
+  ```
+
+DCP goes by the token counts the bridge reports, which are now the real ones. A
+session that does fill its model's window stops with an error instead of being
+compacted; run `/compact` yourself or start a new session.
+
 ### The bridge
 
 When OpenCode starts, the plugin starts the bridge in the background unless it
@@ -209,6 +260,8 @@ plugin's own messages.
 | `Refresh failed: Invalid request` | Your Identity Center is outside `us-east-1` and the clone predates the region fix. `git pull`, then restart the bridge. |
 | A subagent doesn't follow the session's provider | Only sessions on `kiro` or `anthropic` are followed. A `kept ...` line in `bridge.log` gives the reason. |
 | `/health` says `"region":"us-east-1"`, but your Identity Center is elsewhere | Expected. `/health` shows `default_region` from `kiro.json`; requests go to the region of your Kiro profile (`kiro-cli whoami`), token refresh to your Identity Center region. |
+| `input is too long for requested model` | Usually the conversation no longer fits the model's window: run `/compact` or start a new session. A clone from before the history fold gets it after about 100 rounds of tool calls: `git pull`, then restart the bridge. |
+| A session is compacted although `"compaction": { "auto": false }` is set | oh-my-openagent compacted it (toast `Context Limit Hit`). Disable its hook as in [Long sessions and DCP](#long-sessions-and-dcp). |
 
 ## Quick start (OpenCode V2)
 
@@ -338,7 +391,7 @@ Environment variables (optional):
 | `KIRO_BRIDGE_HOST` | `127.0.0.1` | Bind address. |
 | `KIRO_BRIDGE_TOKEN` | – | Extra accepted bridge key(s), comma/space separated. |
 | `KIRO_NODE` | `node` | Node binary used to spawn the bridge. |
-| `KIRO_CLI` | `~/.local/bin/kiro-cli`, else `kiro-cli` on `PATH` | kiro-cli the 1.x plugin reads your model list from. |
+| `KIRO_CLI` | `~/.local/bin/kiro-cli`, else `kiro-cli` on `PATH` | kiro-cli the 1.x plugin reads your model list from, and the bridge the models' context windows. |
 | `KIROCLI_DB_PATH` | – | Override the Kiro CLI database path used for sync. |
 
 ## Models
@@ -346,7 +399,8 @@ Environment variables (optional):
 `-thinking` models stream reasoning in `reasoning_content`.
 
 On OpenCode 1.x the plugin also adds the models your account lists in
-`kiro-cli chat --list-models`. Claude ids use dashes as on `anthropic/...`
+`kiro-cli chat --list-models`, and takes every model's context window from that
+list. Claude ids use dashes as on `anthropic/...`
 (`kiro/claude-opus-5-5` requests `claude-opus-5.5`), and the names show the
 credit multiplier, e.g. `Claude Opus 5.5 (2x)`.
 
@@ -424,6 +478,11 @@ Run `opencode reload`, then connect your API key as in Authentication.
   - **API key:** sends `Authorization: Bearer <ksk_...>` with the
     `tokentype: API_KEY` header. The key lives in the bridge's memory only.
   - **OAuth:** rotates and refreshes the accounts in `kiro.db`.
+  - Kiro accepts at most 200 history messages, so past 180 the bridge folds the
+    oldest into one plain-text transcript.
+  - Kiro sends no token counts, only how full the context is in percent; the
+    bridge multiplies that by the model's window (from kiro-cli, else the
+    bundled list).
 
 On OpenCode 1.x, `opencode-v1.mjs` starts the bridge the same way and adds the
 provider through the 1.x `config` hook (package `@ai-sdk/openai-compatible`),
