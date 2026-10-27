@@ -189,6 +189,77 @@ export function buildHistory(msgs, resolved) {
     }
     return collapseAgenticLoops(history);
 }
+/**
+ * Fold the oldest history entries into one plain-text user entry.
+ *
+ * Kiro rejects a conversation once its history reaches 200 entries ("Input is
+ * too long"), however few tokens it holds, and every tool round adds two. Past
+ * FOLD_AT entries the oldest ones become a transcript in a single user entry.
+ * The cut moves in FOLD_STEP steps, so consecutive requests share the same
+ * folded prefix.
+ */
+const FOLD_AT = 180;
+const FOLD_STEP = 100;
+const FILLER = new Set([
+    '[system: conversation continues]',
+    '[system: tool calling continues]',
+    'Tool results provided.',
+    'Running tools...',
+    'I will execute the following tools.'
+]);
+export function foldHistory(history, resolved) {
+    if (history.length <= FOLD_AT)
+        return history;
+    // Cut just before an assistant entry that follows a user entry: the folded
+    // entry is a user turn, and no toolUse is separated from its toolResults.
+    let cut = FOLD_STEP * Math.ceil((history.length - FOLD_AT) / FOLD_STEP);
+    while (cut < history.length && !(history[cut].assistantResponseMessage && history[cut - 1].userInputMessage))
+        cut++;
+    if (cut >= history.length)
+        return history;
+    const toolNames = new Map();
+    const blocks = [];
+    for (const entry of history.slice(0, cut)) {
+        const arm = entry.assistantResponseMessage;
+        if (arm) {
+            const lines = [];
+            const text = (arm.content || '').replace(/<thinking>[\s\S]*?<\/thinking>\s*/g, '').trim();
+            if (text && !FILLER.has(text))
+                lines.push(text);
+            for (const tu of arm.toolUses || []) {
+                toolNames.set(tu.toolUseId, tu.name);
+                lines.push(`<tool_call name="${tu.name}">${JSON.stringify(tu.input ?? {})}</tool_call>`);
+            }
+            if (lines.length)
+                blocks.push(`<assistant>\n${lines.join('\n')}\n</assistant>`);
+            continue;
+        }
+        const uim = entry.userInputMessage;
+        if (!uim)
+            continue;
+        for (const tr of uim.userInputMessageContext?.toolResults || []) {
+            const output = (tr.content || [])
+                .map((c) => (typeof c.text === 'string' ? c.text : JSON.stringify(c.json ?? c)))
+                .join('\n');
+            const status = tr.status === 'error' ? ' status="error"' : '';
+            blocks.push(`<tool_result name="${toolNames.get(tr.toolUseId) || 'tool'}"${status}>\n${output}\n</tool_result>`);
+        }
+        const raw = (uim.content || '').trim();
+        const text = FILLER.has(raw) ? '' : raw;
+        const images = uim.images?.length ? `[${uim.images.length} image(s) not kept]` : '';
+        const body = [text, images].filter(Boolean).join('\n');
+        if (body)
+            blocks.push(`<user>\n${body}\n</user>`);
+    }
+    const content = '<earlier_conversation>\n' +
+        `The first ${cut} messages of this conversation, kept as plain text because Kiro accepts at most 200 history messages. ` +
+        'They already happened; continue from the messages that follow and call tools the normal way.\n\n' +
+        `${blocks.join('\n\n')}\n</earlier_conversation>`;
+    return [
+        { userInputMessage: { content, modelId: resolved, origin: KIRO_CONSTANTS.ORIGIN_AI_EDITOR } },
+        ...history.slice(cut)
+    ];
+}
 export function injectSystemPrompt(history, system, resolved) {
     if (!system)
         return history;

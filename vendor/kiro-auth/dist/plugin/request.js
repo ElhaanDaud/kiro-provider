@@ -1,7 +1,7 @@
 import * as crypto from 'crypto';
 import * as os from 'os';
 import { KIRO_CONSTANTS, buildUrl, extractRegionFromArn } from '../constants.js';
-import { buildHistory, extractToolNamesFromHistory, historyHasToolCalling, injectSystemPrompt } from '../infrastructure/transformers/history-builder.js';
+import { buildHistory, extractToolNamesFromHistory, foldHistory, historyHasToolCalling, injectSystemPrompt } from '../infrastructure/transformers/history-builder.js';
 import { findOriginalToolCall, getContentText, mergeAdjacentMessages } from '../infrastructure/transformers/message-transformer.js';
 import { convertToolsToCodeWhisperer, createToolNameRegistry, deduplicateToolResults } from '../infrastructure/transformers/tool-transformer.js';
 import { getEffectiveEffort } from './effort.js';
@@ -32,7 +32,9 @@ function buildCodeWhispererRequest(body, model, auth, think = false, budget = 20
     const normalizedTools = Array.isArray(tools) ? tools : [];
     const toolNameRegistry = createToolNameRegistry(normalizedTools);
     const cwTools = convertToolsToCodeWhisperer(normalizedTools, toolNameRegistry);
-    let history = buildHistory(msgs, resolved);
+    // Fold before the system prompt goes into the first user entry, so it stays
+    // on top of the transcript. The pushes below add at most four entries.
+    let history = foldHistory(buildHistory(msgs, resolved), resolved);
     const curMsg = msgs[msgs.length - 1];
     if (!curMsg)
         throw new Error('Empty');
