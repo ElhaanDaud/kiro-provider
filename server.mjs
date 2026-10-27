@@ -9,6 +9,7 @@
 // /v1 request (or a /health probe).
 import http from 'node:http';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { execFile } from 'node:child_process';
@@ -377,6 +378,33 @@ async function warmModelCatalog() {
   }
 }
 
+// --- Context windows ----------------------------------------------------------
+
+// Kiro reports usage only as a percentage of the model's context window, which
+// the bridge turns into token counts. Register each model's real window: the
+// static registry first, then the account's catalog from kiro-cli.
+const LOCAL_KIRO_CLI = path.join(os.homedir(), '.local/bin/kiro-cli');
+const KIRO_CLI = process.env.KIRO_CLI || (fs.existsSync(LOCAL_KIRO_CLI) ? LOCAL_KIRO_CLI : 'kiro-cli');
+
+async function loadContextWindows() {
+  const [{ resolveKiroModel, setContextWindow }, { buildModelRegistry }] = await Promise.all([
+    import(`${PKG}/plugin/models.js`),
+    import(`${PKG}/plugin/model-registry.js`),
+  ]);
+  for (const [id, m] of Object.entries(buildModelRegistry())) setContextWindow(resolveKiroModel(id), m.limit?.context);
+  const child = execFile(KIRO_CLI, ['chat', '--list-models', '--format', 'json'], { timeout: 10_000 }, (err, out) => {
+    try {
+      if (err) throw err;
+      const models = JSON.parse(out).models ?? [];
+      for (const m of models) setContextWindow(m.model_id, m.context_window_tokens);
+      log(`context windows: ${models.length} models from kiro-cli`);
+    } catch (e) {
+      log('context windows: no kiro-cli catalog, using the static registry:', e?.message || e);
+    }
+  });
+  child.stdin?.end();
+}
+
 async function handleApiKeyChat(res, body, apiKey) {
   const deps = await loadApiKeyDeps();
   const parsed = JSON.parse(body);
@@ -542,4 +570,5 @@ server.listen(PORT, HOST, () => {
   }
   log(`auth: required (${KEYS.size} accepted key(s)); connect a Kiro API key with "opencode auth login kiro --method key"`);
   void warmModelCatalog();
+  void loadContextWindows().catch((e) => log('context windows:', e?.message || e));
 });

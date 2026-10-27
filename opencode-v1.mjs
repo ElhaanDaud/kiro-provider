@@ -141,7 +141,14 @@ export default {
     for (const m of live) {
       const claude = m.model_id.startsWith('claude-');
       const key = claude ? m.model_id.replaceAll('.', '-') : m.model_id;
-      if (models[key]) continue;
+      if (models[key]) {
+        // The registry's windows are static guesses; the catalog has the real ones
+        // (DCP limits and OpenCode's context meter are computed from them).
+        const context = m.context_window_tokens;
+        for (const k of [key, `${key}-thinking`])
+          if (context && models[k]) models[k] = { ...models[k], limit: { ...models[k].limit, context } };
+        continue;
+      }
       const name = m.model_id
         .split('-')
         .map((w) => (w === 'gpt' ? 'GPT' : w.charAt(0).toUpperCase() + w.slice(1)))

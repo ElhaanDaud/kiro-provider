@@ -10,6 +10,15 @@ export function resolveKiroModel(model) {
         return model;
     throw new Error(`Unsupported model: ${model}. Supported models: ${SUPPORTED_MODELS.join(', ')}`);
 }
+// Kiro reports usage only as a percentage of the model's context window, so token
+// counts are only as right as this window. The bridge registers the real ones by
+// Kiro model id (setContextWindow); unknown models fall back to the old guess.
+const contextWindows = new Map();
+export function setContextWindow(kiroModel, tokens) {
+    if (typeof kiroModel === 'string' && Number.isFinite(tokens) && tokens > 0)
+        contextWindows.set(kiroModel, tokens);
+}
 export function getContextWindowSize(model) {
-    return isLongContextModel(model) ? 1000000 : 200000;
+    const kiroModel = MODEL_MAPPING[model] ?? model;
+    return contextWindows.get(kiroModel) ?? (isLongContextModel(model) ? 1000000 : 200000);
 }
